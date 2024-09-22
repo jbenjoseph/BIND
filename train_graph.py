@@ -2,11 +2,12 @@ import numpy as np
 import torch
 from torch import nn
 import pytorch_lightning as pl
-from transformers import AutoModel, AutoTokenizer
 from torch_geometric.data import Batch
 from sklearn.metrics import average_precision_score, roc_auc_score, accuracy_score
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from esm.inverse_folding.util import extract_coords_from_structure
+from esm import pretrained
 
 import dataset
 from model_graph import ConditionModel
@@ -38,22 +39,61 @@ class ConditionModelLightning(pl.LightningModule):
         self.loss_classifier = nn.BCEWithLogitsLoss()
         self.learning_rate = 1e-4
         self.iterations = 100000
-        self.esm_tokenizer = AutoTokenizer.from_pretrained(
-            "facebook/esm2_t33_650M_UR50D"
+        self.esmfold_model = pretrained.esmfold_v1().eval().to(self.device)
+        self.inverse_model, self.inverse_alphabet = (
+            pretrained.esm_if1_gvp4_t16_142M_UR50()
         )
-        self.esm_model = AutoModel.from_pretrained("facebook/esm2_t33_650M_UR50D")
-        self.esm_model.eval()
+        self.inverse_model = self.inverse_model.eval().to(self.device)
+        self.inverse_batch_converter = self.inverse_alphabet.get_batch_converter()
 
     def forward(self, sequences, graphs):
-        encoded_input = self.esm_tokenizer(
-            sequences, padding="longest", return_tensors="pt"
-        )
-        esm_output = self.esm_model(
-            **encoded_input.to(self.device), output_hidden_states=True
-        )
-        hidden_states = [x.detach().to(self.device) for x in esm_output.hidden_states]
-        attention_mask = encoded_input["attention_mask"].to(self.device)
-        return self.model(graphs, hidden_states, attention_mask)
+        # Generate structures using ESMFold
+        structures = []
+        for seq in sequences:
+            with torch.no_grad():
+                pdb_str = self.esmfold_model.infer_pdb(seq)
+                structures.append(pdb_str)
+        # Parse the PDB strings to extract coordinates
+        coords_list = []
+        seqs = []
+        for pdb_str in structures:
+            coords, seq = extract_coords_from_structure(pdb_str)
+            coords_list.append(coords)
+            seqs.append(seq)
+
+        # Prepare data for the inverse folding model
+        batch = []
+        for seq, coords in zip(seqs, coords_list):
+            batch.append((seq, coords))
+
+        # Use the inverse folding model's batch converter
+        (
+            batch_labels,
+            batch_strs,
+            batch_coords,
+            batch_tokens,
+            padding_mask,
+        ) = self.inverse_batch_converter(batch)
+
+        batch_coords = batch_coords.to(self.device)
+        batch_tokens = batch_tokens.to(self.device)
+        padding_mask = padding_mask.to(self.device)
+
+        with torch.no_grad():
+            out = self.inverse_model(
+                coords=batch_coords,
+                tokens=batch_tokens,
+                padding_mask=padding_mask,
+                repr_layers=[16],
+                return_contacts=False,
+            )
+            token_embeddings = out["representations"][16]
+
+        # Use the padding_mask as attention_mask
+        attention_mask = ~padding_mask
+
+        # Pass token_embeddings and attention_mask to self.model
+        return self.model(graphs, [token_embeddings], attention_mask)
 
     def training_step(self, batch, batch_idx):
         sequences = [item["sequence"] for item in batch]
